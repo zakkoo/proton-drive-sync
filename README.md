@@ -31,4 +31,4 @@ omarchy plugin update io.github.zakkoo.proton-drive
 omarchy plugin remove io.github.zakkoo.proton-drive
 ```
 
-`Omarchy plugin remove` takes the chip off your bar and stops the engine with it. It does not delete your sync folder, your Proton session, or the tool's config. Your files stay.
+`omarchy plugin remove` takes the chip off your bar and stops the engine with it. It does not delete your sync folder, your Proton session, or the tool's config. Your files stay.
