@@ -20,6 +20,107 @@ function seedTree(): { fake: FakeRemote; root: string } {
   return { fake, root };
 }
 
+describe('RemoteMirror and changes the engine made itself', () => {
+  it('reflects an own change at once, and a node that is gone takes its descendants with it', async () => {
+    const { fake, root } = seedTree();
+    const mirror = new RemoteMirror(fake, root, () => 1000);
+    await mirror.fullRefresh();
+    const a = [...mirror.view().items.values()].find((i) => i.name === 'a.txt');
+    if (a === undefined) throw new Error('a.txt not listed');
+    mirror.applyOwnChange({ type: 'upsert', node: await fake.rename(a.uid, 'renamed.txt') });
+    expect(mirror.view().items.get(a.uid)?.name).toBe('renamed.txt');
+    const sub = [...mirror.view().items.values()].find((i) => i.name === 'sub');
+    if (sub === undefined) throw new Error('sub not listed');
+    mirror.applyOwnChange({ type: 'remove', uid: sub.uid });
+    // The sync root itself is in the view too.
+    expect([...mirror.view().items.values()].map((i) => i.name).sort()).toEqual(['Sync', 'renamed.txt']);
+  });
+
+  it('an event that read a node before an own change does not overwrite that change', async () => {
+    const { fake, root } = seedTree();
+    const mirror = new RemoteMirror(fake, root, () => 1000);
+    await mirror.fullRefresh();
+    const a = [...mirror.view().items.values()].find((i) => i.name === 'a.txt');
+    if (a === undefined) throw new Error('a.txt not listed');
+    // The event's re-read gets the node (still a.txt), then is slow to come back.
+    const get = fake.getNode.bind(fake);
+    let read!: () => void;
+    let resume!: () => void;
+    const atRead = new Promise<void>((r) => { read = r; });
+    const resumed = new Promise<void>((r) => { resume = r; });
+    fake.getNode = async (uid: string) => {
+      const node = await get(uid);
+      fake.getNode = get;
+      read();
+      await resumed;
+      return node;
+    };
+    const applying = mirror.applyEvent({ type: 'node_updated', nodeUid: a.uid, parentUid: root, isTrashed: false, eventId: '9', scopeId: 'scope-1' });
+    await atRead;
+    mirror.applyOwnChange({ type: 'upsert', node: await fake.rename(a.uid, 'renamed.txt') });
+    resume();
+    await applying;
+    expect(mirror.view().items.get(a.uid)?.name).toBe('renamed.txt');
+  });
+
+  it('an event that read a node does not bring it back after an own removal of its folder', async () => {
+    const { fake, root } = seedTree();
+    const mirror = new RemoteMirror(fake, root, () => 1000);
+    await mirror.fullRefresh();
+    const sub = [...mirror.view().items.values()].find((i) => i.name === 'sub');
+    const b = [...mirror.view().items.values()].find((i) => i.name === 'b.txt');
+    if (sub === undefined || b === undefined) throw new Error('sub/b.txt not listed');
+    // The child's event re-read gets the node, then is slow to come back.
+    const get = fake.getNode.bind(fake);
+    let read!: () => void;
+    let resume!: () => void;
+    const atRead = new Promise<void>((r) => { read = r; });
+    const resumed = new Promise<void>((r) => { resume = r; });
+    fake.getNode = async (uid: string) => {
+      const node = await get(uid);
+      fake.getNode = get;
+      read();
+      await resumed;
+      return node;
+    };
+    const applying = mirror.applyEvent({ type: 'node_updated', nodeUid: b.uid, parentUid: sub.uid, isTrashed: false, eventId: '9', scopeId: 'scope-1' });
+    await atRead;
+    // The engine removes the folder, and with it the child.
+    mirror.applyOwnChange({ type: 'remove', uid: sub.uid });
+    resume();
+    await applying;
+    expect(mirror.view().items.has(b.uid)).toBe(false);
+  });
+
+  it('keeps an own change made while a full listing was under way', async () => {
+    const { fake, root } = seedTree();
+    const mirror = new RemoteMirror(fake, root, () => 1000);
+    await mirror.fullRefresh();
+    const a = [...mirror.view().items.values()].find((i) => i.name === 'a.txt');
+    if (a === undefined) throw new Error('a.txt not listed');
+    // The listing reads the root's children (a.txt still under its old name), then waits.
+    const list = fake.listChildren.bind(fake);
+    let listed!: () => void;
+    let resume!: () => void;
+    const atPause = new Promise<void>((r) => { listed = r; });
+    fake.listChildren = async (parentUid: string) => {
+      const children = await list(parentUid);
+      if (parentUid === root) {
+        listed();
+        await new Promise<void>((r) => { resume = r; });
+      }
+      return children;
+    };
+    const refreshing = mirror.fullRefresh();
+    await atPause;
+    mirror.applyOwnChange({ type: 'upsert', node: await fake.rename(a.uid, 'renamed.txt') });
+    resume();
+    await refreshing;
+    // The listing's older result does not undo the rename the engine made meanwhile.
+    expect(mirror.view().items.get(a.uid)?.name).toBe('renamed.txt');
+  });
+});
+
 describe('RemoteMirror modifiedAt', () => {
   it('reports when a known item last changed, and nothing for an unknown one', async () => {
     const { fake, root } = seedTree();

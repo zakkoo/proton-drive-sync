@@ -28,7 +28,7 @@ import type { RemoteChangeFeed } from '../remote/events.js';
 import { RemoteError } from '../remote/interface.js';
 import type { Logger } from '../remote/proton/logger.js';
 import type { SessionState } from '../remote/proton/sessionState.js';
-import { heldAffected, type PlanGate } from '../safety/brake.js';
+import { type HeldPlan, heldAffected, type PlanGate } from '../safety/brake.js';
 import { blockUnsyncableTargets } from '../safety/pathGuard.js';
 import type { PreflightResult } from '../safety/preflight.js';
 import type { QuarantineService } from '../safety/quarantine.js';
@@ -72,6 +72,8 @@ export class SyncEngine extends EventEmitter {
   private readonly now: () => number;
   private cycleRunning: Promise<CycleResult | null> | null = null;
   private dirty = false;
+  /** The end of the last cycle, conflict resolution or confirmed plan to start; see `exclusive`. */
+  private exclusiveTail: Promise<void> = Promise.resolve();
   private triggerTimer: NodeJS.Timeout | null = null;
   private listingTimer: NodeJS.Timeout | null = null;
   private executor: Executor | null = null;
@@ -287,11 +289,19 @@ export class SyncEngine extends EventEmitter {
     await this.deps.feed?.stop();
     await this.deps.watcher.stop();
     await this.cycleRunning;
+    // A resolution or confirmed plan waiting its turn: let it finish (or refuse to start).
+    await this.exclusiveTail;
     if (this.status.state !== 'stopped') this.setState('stopped');
   }
 
   private ctx(): ExecutorContext {
-    return { ...this.deps.executorContext, config: { concurrency: this.deps.config.transfers.concurrency, maxRetries: this.deps.config.transfers.maxRetries, dryRun: this.deps.config.dryRun }, onEvent: (e) => { this.onExecutorEvent(e); } };
+    return {
+      ...this.deps.executorContext,
+      config: { concurrency: this.deps.config.transfers.concurrency, maxRetries: this.deps.config.transfers.maxRetries, dryRun: this.deps.config.dryRun },
+      onEvent: (e) => { this.onExecutorEvent(e); },
+      // Our own changes on Proton reach the remote view at once, not when their events arrive.
+      onRemoteChange: (change) => { this.deps.mirror.applyOwnChange(change); },
+    };
   }
 
   // ---- inputs from watcher and feed --------------------------------------
@@ -414,8 +424,12 @@ export class SyncEngine extends EventEmitter {
       do {
         this.dirty = false;
         try {
-          result = await this.cycleOnce(reason);
+          result = await this.exclusive(() => this.cycleOnce(reason));
         } catch (error) {
+          if (error instanceof EngineStoppingError) {
+            result = null;
+            break;
+          }
           this.deps.logger.error('cycle failed', error);
           this.deps.audit.append({ kind: 'engine', message: `cycle failed: ${error instanceof Error ? error.message : String(error)}`, outcome: 'failed' });
           this.remoteFailure(error);
@@ -427,6 +441,28 @@ export class SyncEngine extends EventEmitter {
       this.cycleRunning = null;
     });
     return this.cycleRunning;
+  }
+
+  /**
+   * Run `work` once the cycle, conflict resolution or confirmed plan before it has finished, and
+   * make the next one wait for it. Each reads the baseline and both trees and changes them; one
+   * that ran during another would plan from a half-done change (a cycle in the middle of a
+   * resolution saw the restored file beside the trashed original and recorded a new conflict).
+   */
+  private async exclusive<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.exclusiveTail;
+    let finished!: () => void;
+    this.exclusiveTail = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    try {
+      await previous;
+      // Once stopping has begun, nothing more may change files or state.
+      if (this.stopped) throw new EngineStoppingError();
+      return await work();
+    } finally {
+      finished();
+    }
   }
 
   /** Read through a method: the flag is mutated by triggers while a cycle awaits. */
@@ -682,9 +718,16 @@ export class SyncEngine extends EventEmitter {
   }
 
   async confirmHeldPlan(id: string): Promise<CycleResult | null> {
-    const held = this.deps.gate.current;
-    // Take the plan before any await, so a cycle running meanwhile cannot hold it again.
-    const plan = this.deps.gate.confirm(id);
+    // Take turns with cycles, and take the plan inside the turn: a cycle that ran meanwhile has
+    // either held the same work again under the same id, or a different plan whose new id refuses
+    // this confirmation (and a plan taken before waiting could be held again by a running cycle).
+    return this.exclusive(() => {
+      const held = this.deps.gate.current;
+      return this.runConfirmedPlan(held, this.deps.gate.confirm(id));
+    });
+  }
+
+  private async runConfirmedPlan(held: HeldPlan | null, plan: Plan): Promise<CycleResult | null> {
     let failure: string | null;
     try {
       failure = await this.preflightFailure(plannedDownloadBytes(plan, this.deps.mirror.view()));
@@ -712,6 +755,11 @@ export class SyncEngine extends EventEmitter {
     // Resolving rewrites baseline rows and closes the conflict directly; only its file operations
     // go through the (dry-run) executor, so in a preview it would record changes that never happen.
     if (this.deps.config.dryRun) throw new Error('Dry run: conflicts are not resolved; turn dry run off to resolve them');
+    // A cycle running meanwhile would plan from a half-done resolution: take turns with cycles.
+    await this.exclusive(() => this.resolveConflictNow(id, choice));
+  }
+
+  private async resolveConflictNow(id: number, choice: Resolution): Promise<void> {
     // Resolving changes the baseline and plans moves, recycles and trashes: refuse it for the wrong root.
     const failure = await this.preflightFailure(0);
     if (failure !== null) throw new Error(`cannot resolve conflict ${String(id)}: ${failure}`);
@@ -730,6 +778,14 @@ export class SyncEngine extends EventEmitter {
     this.deps.quarantine.release(id);
     this.trigger('quarantine released');
     this.publish();
+  }
+}
+
+/** Work refused because the engine is stopping. */
+export class EngineStoppingError extends Error {
+  constructor() {
+    super('The engine is stopping');
+    this.name = 'EngineStoppingError';
   }
 }
 

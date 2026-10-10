@@ -232,6 +232,214 @@ describe('SyncEngine', () => {
     expect(h.remoteFiles().get('doc.md')).toBe('local');
   });
 
+  /**
+   * Proton's event stream under the test's control: while `hold()` is in effect, polls return no
+   * events, as when events lag behind the engine's own changes under load.
+   */
+  function controlEvents(): { hold: () => void; release: () => void; heldPolls: () => number } {
+    const fake = h.fake as unknown as { iterateEvents: (...args: unknown[]) => AsyncIterable<unknown> };
+    const iterate = fake.iterateEvents.bind(h.fake);
+    let held = false;
+    let heldPolls = 0;
+    // An event stream that ends at once: no events this poll.
+    const none: AsyncIterable<never> = { [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true as const, value: undefined }) }) };
+    fake.iterateEvents = (...args: unknown[]) => {
+      if (!held) return iterate(...args);
+      heldPolls++;
+      return none;
+    };
+    return { hold: () => { held = true; }, release: () => { held = false; }, heldPolls: () => heldPolls };
+  }
+
+  /** A content conflict on doc.md whose copy is synced and known to the engine's view of Proton. */
+  async function contentConflictOnDoc(): Promise<{ id: number; hold: () => void; release: () => void; heldPolls: () => number }> {
+    h.write('doc.md', 'base');
+    await h.start();
+    await h.waitForConvergence();
+    const fake = h.fake as unknown as { calls: { op: string }[] };
+    const events = controlEvents();
+    h.bundle?.engine.pause();
+    await h.waitFor(['paused']);
+    h.write('doc.md', 'local');
+    h.fake.seedRevision(h.remotePathToUid('doc.md') ?? '', 'remote');
+    h.bundle?.engine.resume();
+    await h.waitFor(['attention']);
+    await h.waitForConvergence();
+    const baseline = new BaselineRepo(h.live.store);
+    for (let i = 0; i < 200 && baseline.byPath('doc.md') === null; i++) await new Promise((r) => setTimeout(r, 20));
+    // Let the event stream catch up on the copy's upload (two polls after it).
+    const uploadedAt = fake.calls.map((c) => c.op).lastIndexOf('upload');
+    for (let i = 0; i < 250 && fake.calls.slice(uploadedAt + 1).filter((c) => c.op === 'events').length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    const conflict = h.bundle?.controlTarget.listConflicts()[0];
+    expect(conflict?.kind).toBe('content');
+    return { id: conflict?.id ?? 0, ...events };
+  }
+
+  /** Pause the next rename on Proton until `resume()`; `reached` settles when it is called. */
+  function pauseNextRename(): { reached: Promise<void>; resume: () => void } {
+    const fake = h.fake as unknown as { rename: (uid: string, name: string) => Promise<unknown> };
+    const rename = fake.rename.bind(h.fake);
+    let reachedNow!: () => void;
+    let resumeNow!: () => void;
+    const reached = new Promise<void>((r) => { reachedNow = r; });
+    const resumed = new Promise<void>((r) => { resumeNow = r; });
+    fake.rename = async (uid: string, name: string) => {
+      fake.rename = rename;
+      reachedNow();
+      await resumed;
+      return rename(uid, name);
+    };
+    return { reached, resume: () => { resumeNow(); } };
+  }
+
+  /** After keep_local and convergence: one file, the local version, on both sides, no conflict left. */
+  async function expectLocalKept(): Promise<void> {
+    await h.waitForConvergence();
+    expect(h.bundle?.controlTarget.listConflicts()).toEqual([]);
+    expect([...h.localFiles().entries()]).toEqual([['doc.md', 'local']]);
+    expect(h.remoteFiles().get('doc.md')).toBe('local');
+  }
+
+  it('keep_local is not undone by the next cycle while Proton has not yet reported the resolution', async () => {
+    const conflict = await contentConflictOnDoc();
+    conflict.hold();
+    await h.bundle?.engine.resolveConflict(conflict.id, 'keep_local');
+    // The next cycle plans from the engine's view of Proton, which the lagging events have not
+    // updated: it must already reflect the trash and the rename the resolution made itself.
+    await h.bundle?.engine.runCycle('test: right after the resolution');
+    expect(h.bundle?.controlTarget.listConflicts()).toEqual([]);
+    expect([...h.localFiles().entries()]).toEqual([['doc.md', 'local']]);
+    conflict.release();
+    await expectLocalKept();
+  });
+
+  it('a cycle requested while a conflict is being resolved waits for the resolution to finish', async () => {
+    const conflict = await contentConflictOnDoc();
+    // Pause the resolution half way, at its rename of the copy on Proton (after the original is
+    // trashed and recycled, before the copy takes its place).
+    const rename = pauseNextRename();
+    const resolving = h.bundle?.engine.resolveConflict(conflict.id, 'keep_local');
+    await rename.reached;
+    const started = h.bundle?.engine.getStatus().lastCycleAt;
+    const cycle = h.bundle?.engine.runCycle('test: during the resolution');
+    await new Promise((r) => setTimeout(r, 300));
+    // The cycle has not started: it would plan from a half-done resolution.
+    expect(h.bundle?.engine.getStatus().lastCycleAt).toBe(started);
+    rename.resume();
+    await resolving;
+    await cycle;
+    expect(h.bundle?.engine.getStatus().lastCycleAt).not.toBe(started);
+    await expectLocalKept();
+  });
+
+  it('stopping waits for a resolution in progress, and refuses one asked for after it began', async () => {
+    const conflict = await contentConflictOnDoc();
+    const rename = pauseNextRename();
+    let resolutionSettled = false;
+    const resolving = (h.bundle?.engine.resolveConflict(conflict.id, 'keep_local') ?? Promise.resolve()).finally(() => { resolutionSettled = true; });
+    await rename.reached;
+    let stopSettled = false;
+    const stopping = (h.bundle?.engine.stop() ?? Promise.resolve()).finally(() => { stopSettled = true; });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(stopSettled).toBe(false);
+    rename.resume();
+    await resolving.catch(() => undefined);
+    await stopping;
+    expect(resolutionSettled).toBe(true);
+    await expect(h.bundle?.engine.resolveConflict(conflict.id, 'keep_both')).rejects.toThrow(/stopping/);
+  });
+
+  it('the engine knows of a file it just uploaded before Proton reports it, and leaves it in place', async () => {
+    await h.start();
+    await h.waitForConvergence();
+    const events = controlEvents();
+    events.hold();
+    h.write('new.txt', 'N');
+    for (let i = 0; i < 200 && !h.remoteFiles().has('new.txt'); i++) await new Promise((r) => setTimeout(r, 20));
+    await h.waitForConvergence();
+    // Polls keep completing after the upload, without its event (so the view looks current).
+    const polled = events.heldPolls();
+    for (let i = 0; i < 250 && events.heldPolls() < polled + 2; i++) await new Promise((r) => setTimeout(r, 20));
+    // The view of Proton has not heard of the upload from its event; the engine made it, so it knows.
+    await h.bundle?.engine.runCycle('test: right after the upload');
+    // Its view of Proton (which the status counts) already has the file.
+    expect(h.bundle?.engine.getStatus().counts.remoteFiles).toBe(1);
+    expect(h.localFiles().get('new.txt')).toBe('N');
+    expect(h.bundle?.recycle.list()).toEqual([]);
+    events.release();
+    await h.waitForConvergence();
+    expect(h.localFiles().get('new.txt')).toBe('N');
+    expect(h.remoteFiles().get('new.txt')).toBe('N');
+  });
+
+  it('confirming a held plan while a cycle runs takes the plan only when the cycle is done', async () => {
+    for (let i = 0; i < 10; i++) h.write(`f${String(i)}.txt`, String(i));
+    h.config = { ...h.config, safety: { ...h.config.safety, brakeMaxChanges: 3 } };
+    await h.start();
+    await h.waitForConvergence();
+    for (let i = 0; i < 6; i++) await h.fake.trash([h.remotePathToUid(`f${String(i)}.txt`) ?? '']);
+    const status = await h.waitFor(['awaiting_confirmation']);
+    const id = status.attention.heldPlan?.id ?? '';
+    // A cycle that is running: paused in the upload of a new file.
+    let reached!: () => void;
+    let resume!: () => void;
+    const atUpload = new Promise<void>((r) => { reached = r; });
+    const resumed = new Promise<void>((r) => { resume = r; });
+    h.fake.beforeUploadCommit = async () => {
+      h.fake.beforeUploadCommit = undefined;
+      reached();
+      await resumed;
+    };
+    h.write('slow.txt', 'S');
+    await atUpload;
+    const confirming = h.bundle?.engine.confirmHeldPlan(id);
+    await new Promise((r) => setTimeout(r, 300));
+    // Still held under the same id: the confirmation waits for the cycle instead of taking the plan.
+    expect(h.bundle?.engine.getStatus().attention.heldPlan?.id).toBe(id);
+    resume();
+    await confirming;
+    await h.waitForConvergence();
+    expect(h.bundle?.engine.getStatus().attention.heldPlan).toBeNull();
+    expect(h.localFiles().has('f0.txt')).toBe(false);
+    expect(h.bundle?.recycle.list().filter((r) => r.kind === 'file')).toHaveLength(6);
+    expect(h.remoteFiles().get('slow.txt')).toBe('S');
+  });
+
+  it('an upload whose response was lost is still known to the engine before Proton reports it', async () => {
+    await h.start();
+    await h.waitForConvergence();
+    const events = controlEvents();
+    events.hold();
+    // The upload lands on Proton, but the engine sees a timeout and finds it there on retry.
+    h.fake.injectFault('upload', { kind: 'unknown_outcome' });
+    h.write('new.txt', 'N');
+    for (let i = 0; i < 200 && !h.remoteFiles().has('new.txt'); i++) await new Promise((r) => setTimeout(r, 20));
+    await h.waitForConvergence();
+    const polled = events.heldPolls();
+    for (let i = 0; i < 250 && events.heldPolls() < polled + 2; i++) await new Promise((r) => setTimeout(r, 20));
+    await h.bundle?.engine.runCycle('test: right after the recovered upload');
+    expect(h.bundle?.engine.getStatus().counts.remoteFiles).toBe(1);
+    expect(h.localFiles().get('new.txt')).toBe('N');
+    expect(h.bundle?.recycle.list()).toEqual([]);
+    events.release();
+    await h.waitForConvergence();
+    expect(h.localFiles().get('new.txt')).toBe('N');
+    expect(h.remoteFiles().get('new.txt')).toBe('N');
+  });
+
+  it('keep_local is not undone when the response to its rename on Proton was lost', async () => {
+    const conflict = await contentConflictOnDoc();
+    conflict.hold();
+    // The rename lands on Proton, but the engine sees a timeout and finds it done on retry.
+    h.fake.injectFault('rename', { kind: 'unknown_outcome' });
+    await h.bundle?.engine.resolveConflict(conflict.id, 'keep_local');
+    await h.bundle?.engine.runCycle('test: right after the resolution');
+    expect(h.bundle?.controlTarget.listConflicts()).toEqual([]);
+    expect([...h.localFiles().entries()]).toEqual([['doc.md', 'local']]);
+    conflict.release();
+    await expectLocalKept();
+  });
+
   it('quarantines a verification failure and re-reconciles after release', async () => {
     await h.start();
     await h.waitFor(['idle']);

@@ -2,6 +2,7 @@
  * In-memory mirror of the remote tree under the sync root, kept current by
  * the event feed and refreshed by full listings (startup, expiry, interval).
  */
+import type { RemoteChange } from '../execute/types.js';
 import type { NodeRemoteEvent } from '../remote/events.js';
 import type { RemoteDrive, RemoteNode } from '../remote/interface.js';
 import type { RemoteView } from '../reconcile/types.js';
@@ -14,6 +15,11 @@ export class RemoteMirror {
   lastFullListingAt: number | null = null;
   /** The mirror reflects the server at least as of this time (start of the last listing or completed poll). */
   private asOf: number | undefined;
+  /** The engine's own changes made while each full listing in progress was under way. */
+  private readonly ownChangesDuringListings = new Set<RemoteChange[]>();
+  /** Counts the engine's own changes; per node, the count when it was last changed so. */
+  private ownChanges = 0;
+  private readonly ownChangedAt = new Map<string, number>();
 
   constructor(
     private readonly remote: RemoteDrive,
@@ -32,9 +38,13 @@ export class RemoteMirror {
   /** Replace the mirror with a complete listing. Throws (and marks unavailable) on failure. */
   async fullRefresh(signal?: AbortSignal): Promise<void> {
     const startedAt = this.now();
+    const ownChanges: RemoteChange[] = [];
+    this.ownChangesDuringListings.add(ownChanges);
     try {
       const nodes = await listRemoteTree(this.remote, this.rootUid, signal);
       this.nodes = new Map(nodes.map((n) => [n.uid, n]));
+      // The listing may have read a node before the engine changed it: keep the change.
+      for (const change of ownChanges) this.applyChange(change);
       this.complete = true;
       this.available = true;
       this.lastFullListingAt = this.now();
@@ -43,6 +53,8 @@ export class RemoteMirror {
       this.complete = false;
       this.available = false;
       throw error;
+    } finally {
+      this.ownChangesDuringListings.delete(ownChanges);
     }
   }
 
@@ -52,19 +64,59 @@ export class RemoteMirror {
       this.nodes.delete(event.nodeUid);
       return;
     }
+    const readFrom = this.ownChanges;
     const node = await this.remote.getNode(event.nodeUid);
+    // The engine changed this node itself while the read was under way: the read may predate that
+    // change, and the change's own event will come and read the node again.
+    if ((this.ownChangedAt.get(event.nodeUid) ?? 0) > readFrom) return;
     if (node === null) this.nodes.delete(event.nodeUid);
     else this.nodes.set(node.uid, node);
     this.available = true;
   }
 
-  /** Our own completed mutation: reflect it immediately instead of waiting for the event stream. */
+  /**
+   * A change the engine itself made on Proton (the executor reports it once verified): reflect it
+   * at once instead of waiting for its event. Under load the event arrives after the next cycle
+   * has planned, and a plan from the older tree undoes the change or records a conflict with it.
+   * The event, when it comes, re-reads the node and agrees.
+   */
+  applyOwnChange(change: RemoteChange): void {
+    // Every node the change touches (a removal takes the descendants too) is marked as changed by
+    // the engine, so an event read of any of them that was under way is not stored over it.
+    const changedAt = ++this.ownChanges;
+    for (const uid of this.applyChange(change)) this.ownChangedAt.set(uid, changedAt);
+    for (const during of this.ownChangesDuringListings) during.push(change);
+  }
+
   upsert(node: RemoteNode): void {
     this.nodes.set(node.uid, node);
   }
 
-  remove(uid: string): void {
-    this.nodes.delete(uid);
+  /**
+   * Forget a node and everything under it (a trashed folder stays as an upsert, marked trashed).
+   * Returns the uids forgotten.
+   */
+  remove(uid: string): string[] {
+    const gone = new Set([uid]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const node of this.nodes.values()) {
+        if (!gone.has(node.uid) && node.parentUid !== undefined && gone.has(node.parentUid)) {
+          gone.add(node.uid);
+          grew = true;
+        }
+      }
+    }
+    for (const g of gone) this.nodes.delete(g);
+    return [...gone];
+  }
+
+  /** Apply a change; returns the uids it touched. */
+  private applyChange(change: RemoteChange): string[] {
+    if (change.type === 'remove') return this.remove(change.uid);
+    this.upsert(change.node);
+    return [change.node.uid];
   }
 
   /**

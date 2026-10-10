@@ -519,7 +519,7 @@ export class Executor {
         if (op.mode === 'revision' && op.remoteUid !== undefined) {
           const node = await remote.getNode(op.remoteUid);
           if (node !== null && node.claimedSha1 === op.expectedLocal.sha1 && op.expectedLocal.sha1 !== undefined) {
-            return { upserts: [this.localRow(op.relPath, 'file', node, node.claimedSha1 ?? null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: node.revisionUid, landedBeforeRetry: true } };
+            return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'file', node, node.claimedSha1 ?? null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: node.revisionUid, landedBeforeRetry: true } };
           }
           return null;
         }
@@ -528,20 +528,21 @@ export class Executor {
         const match = children.find((c) => c.name === nameOf(op.relPath) && !c.isTrashed && c.type === 'file');
         const expectedSha1 = op.expectedLocal.sha1;
         if (match !== undefined && expectedSha1 !== undefined && match.claimedSha1 === expectedSha1) {
-          return { upserts: [this.localRow(op.relPath, 'file', match, expectedSha1)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, revisionUid: match.revisionUid, landedBeforeRetry: true } };
+          return { remoteChanges: [{ type: 'upsert', node: match }], upserts: [this.localRow(op.relPath, 'file', match, expectedSha1)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, revisionUid: match.revisionUid, landedBeforeRetry: true } };
         }
         return null;
       }
       case 'trash_remote': {
         const node = await remote.getNode(op.remoteUid);
-        return node === null || node.isTrashed ? { upserts: [], removeSubtrees: [op.relPath], renames: [], outcome: { nodeUid: op.remoteUid, landedBeforeRetry: true } } : null;
+        if (node !== null && !node.isTrashed) return null;
+        return { remoteChanges: [node === null ? { type: 'remove', uid: op.remoteUid } : { type: 'upsert', node }], upserts: [], removeSubtrees: [op.relPath], renames: [], outcome: { nodeUid: op.remoteUid, landedBeforeRetry: true } };
       }
       case 'move_remote': {
         const node = await remote.getNode(op.remoteUid);
         if (node !== null && node.parentUid === this.remoteParentUid(op.to) && node.name === nameOf(op.to)) {
-          if (!existsSync(path.join(this.ctx.root, op.to))) return { upserts: [], removeSubtrees: [], renames: [], outcome: { landedBeforeRetry: true, localMoveFollows: true } };
+          if (!existsSync(path.join(this.ctx.root, op.to))) return { remoteChanges: [{ type: 'upsert', node }], upserts: [], removeSubtrees: [], renames: [], outcome: { landedBeforeRetry: true, localMoveFollows: true } };
           const row = this.ctx.baseline.byPath(op.baselineFrom ?? op.from);
-          return { upserts: [this.localRow(op.to, node.type === 'folder' ? 'dir' : 'file', node, row?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { landedBeforeRetry: true } };
+          return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.to, node.type === 'folder' ? 'dir' : 'file', node, row?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { landedBeforeRetry: true } };
         }
         return null;
       }
@@ -551,7 +552,7 @@ export class Executor {
         const match = children.find((c) => c.name === nameOf(op.relPath) && !c.isTrashed && c.type === 'folder');
         if (match === undefined) return null;
         this.createdRemoteDirs.set(op.relPath, match.uid);
-        return { upserts: [this.localRow(op.relPath, 'dir', match, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, landedBeforeRetry: true } };
+        return { remoteChanges: [{ type: 'upsert', node: match }], upserts: [this.localRow(op.relPath, 'dir', match, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, landedBeforeRetry: true } };
       }
       case 'create_local_folder':
       case 'download':

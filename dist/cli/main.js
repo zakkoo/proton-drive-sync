@@ -20471,7 +20471,7 @@ var Executor = class {
         if (op.mode === "revision" && op.remoteUid !== void 0) {
           const node = await remote.getNode(op.remoteUid);
           if (node !== null && node.claimedSha1 === op.expectedLocal.sha1 && op.expectedLocal.sha1 !== void 0) {
-            return { upserts: [this.localRow(op.relPath, "file", node, node.claimedSha1 ?? null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: node.revisionUid, landedBeforeRetry: true } };
+            return { remoteChanges: [{ type: "upsert", node }], upserts: [this.localRow(op.relPath, "file", node, node.claimedSha1 ?? null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: node.revisionUid, landedBeforeRetry: true } };
           }
           return null;
         }
@@ -20480,20 +20480,21 @@ var Executor = class {
         const match = children2.find((c2) => c2.name === nameOf(op.relPath) && !c2.isTrashed && c2.type === "file");
         const expectedSha1 = op.expectedLocal.sha1;
         if (match !== void 0 && expectedSha1 !== void 0 && match.claimedSha1 === expectedSha1) {
-          return { upserts: [this.localRow(op.relPath, "file", match, expectedSha1)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, revisionUid: match.revisionUid, landedBeforeRetry: true } };
+          return { remoteChanges: [{ type: "upsert", node: match }], upserts: [this.localRow(op.relPath, "file", match, expectedSha1)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, revisionUid: match.revisionUid, landedBeforeRetry: true } };
         }
         return null;
       }
       case "trash_remote": {
         const node = await remote.getNode(op.remoteUid);
-        return node === null || node.isTrashed ? { upserts: [], removeSubtrees: [op.relPath], renames: [], outcome: { nodeUid: op.remoteUid, landedBeforeRetry: true } } : null;
+        if (node !== null && !node.isTrashed) return null;
+        return { remoteChanges: [node === null ? { type: "remove", uid: op.remoteUid } : { type: "upsert", node }], upserts: [], removeSubtrees: [op.relPath], renames: [], outcome: { nodeUid: op.remoteUid, landedBeforeRetry: true } };
       }
       case "move_remote": {
         const node = await remote.getNode(op.remoteUid);
         if (node !== null && node.parentUid === this.remoteParentUid(op.to) && node.name === nameOf(op.to)) {
-          if (!existsSync4(path13.join(this.ctx.root, op.to))) return { upserts: [], removeSubtrees: [], renames: [], outcome: { landedBeforeRetry: true, localMoveFollows: true } };
+          if (!existsSync4(path13.join(this.ctx.root, op.to))) return { remoteChanges: [{ type: "upsert", node }], upserts: [], removeSubtrees: [], renames: [], outcome: { landedBeforeRetry: true, localMoveFollows: true } };
           const row2 = this.ctx.baseline.byPath(op.baselineFrom ?? op.from);
-          return { upserts: [this.localRow(op.to, node.type === "folder" ? "dir" : "file", node, row2?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { landedBeforeRetry: true } };
+          return { remoteChanges: [{ type: "upsert", node }], upserts: [this.localRow(op.to, node.type === "folder" ? "dir" : "file", node, row2?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { landedBeforeRetry: true } };
         }
         return null;
       }
@@ -20503,7 +20504,7 @@ var Executor = class {
         const match = children2.find((c2) => c2.name === nameOf(op.relPath) && !c2.isTrashed && c2.type === "folder");
         if (match === void 0) return null;
         this.createdRemoteDirs.set(op.relPath, match.uid);
-        return { upserts: [this.localRow(op.relPath, "dir", match, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, landedBeforeRetry: true } };
+        return { remoteChanges: [{ type: "upsert", node: match }], upserts: [this.localRow(op.relPath, "dir", match, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, landedBeforeRetry: true } };
       }
       case "create_local_folder":
       case "download":
@@ -21639,6 +21640,8 @@ var SyncEngine = class extends EventEmitter {
   now;
   cycleRunning = null;
   dirty = false;
+  /** The end of the last cycle, conflict resolution or confirmed plan to start; see `exclusive`. */
+  exclusiveTail = Promise.resolve();
   triggerTimer = null;
   listingTimer = null;
   executor = null;
@@ -21814,12 +21817,21 @@ var SyncEngine = class extends EventEmitter {
     await this.deps.feed?.stop();
     await this.deps.watcher.stop();
     await this.cycleRunning;
+    await this.exclusiveTail;
     if (this.status.state !== "stopped") this.setState("stopped");
   }
   ctx() {
-    return { ...this.deps.executorContext, config: { concurrency: this.deps.config.transfers.concurrency, maxRetries: this.deps.config.transfers.maxRetries, dryRun: this.deps.config.dryRun }, onEvent: (e2) => {
-      this.onExecutorEvent(e2);
-    } };
+    return {
+      ...this.deps.executorContext,
+      config: { concurrency: this.deps.config.transfers.concurrency, maxRetries: this.deps.config.transfers.maxRetries, dryRun: this.deps.config.dryRun },
+      onEvent: (e2) => {
+        this.onExecutorEvent(e2);
+      },
+      // Our own changes on Proton reach the remote view at once, not when their events arrive.
+      onRemoteChange: (change) => {
+        this.deps.mirror.applyOwnChange(change);
+      }
+    };
   }
   // ---- inputs from watcher and feed --------------------------------------
   async onLocalEvent(event) {
@@ -21928,8 +21940,12 @@ var SyncEngine = class extends EventEmitter {
       do {
         this.dirty = false;
         try {
-          result = await this.cycleOnce(reason);
+          result = await this.exclusive(() => this.cycleOnce(reason));
         } catch (error) {
+          if (error instanceof EngineStoppingError) {
+            result = null;
+            break;
+          }
           this.deps.logger.error("cycle failed", error);
           this.deps.audit.append({ kind: "engine", message: `cycle failed: ${error instanceof Error ? error.message : String(error)}`, outcome: "failed" });
           this.remoteFailure(error);
@@ -21941,6 +21957,26 @@ var SyncEngine = class extends EventEmitter {
       this.cycleRunning = null;
     });
     return this.cycleRunning;
+  }
+  /**
+   * Run `work` once the cycle, conflict resolution or confirmed plan before it has finished, and
+   * make the next one wait for it. Each reads the baseline and both trees and changes them; one
+   * that ran during another would plan from a half-done change (a cycle in the middle of a
+   * resolution saw the restored file beside the trashed original and recorded a new conflict).
+   */
+  async exclusive(work) {
+    const previous = this.exclusiveTail;
+    let finished;
+    this.exclusiveTail = new Promise((resolve) => {
+      finished = resolve;
+    });
+    try {
+      await previous;
+      if (this.stopped) throw new EngineStoppingError();
+      return await work();
+    } finally {
+      finished();
+    }
   }
   /** Read through a method: the flag is mutated by triggers while a cycle awaits. */
   shouldRerun() {
@@ -22163,8 +22199,12 @@ var SyncEngine = class extends EventEmitter {
     return this.runCycle("sync now");
   }
   async confirmHeldPlan(id2) {
-    const held2 = this.deps.gate.current;
-    const plan = this.deps.gate.confirm(id2);
+    return this.exclusive(() => {
+      const held2 = this.deps.gate.current;
+      return this.runConfirmedPlan(held2, this.deps.gate.confirm(id2));
+    });
+  }
+  async runConfirmedPlan(held2, plan) {
     let failure;
     try {
       failure = await this.preflightFailure(plannedDownloadBytes(plan, this.deps.mirror.view()));
@@ -22187,6 +22227,9 @@ var SyncEngine = class extends EventEmitter {
   }
   async resolveConflict(id2, choice) {
     if (this.deps.config.dryRun) throw new Error("Dry run: conflicts are not resolved; turn dry run off to resolve them");
+    await this.exclusive(() => this.resolveConflictNow(id2, choice));
+  }
+  async resolveConflictNow(id2, choice) {
     const failure = await this.preflightFailure(0);
     if (failure !== null) throw new Error(`cannot resolve conflict ${String(id2)}: ${failure}`);
     const run2 = async (ops) => (await this.executePlan({ ...emptyPlan(), operations: ops }, { dependent: true })).completed === ops.length;
@@ -22201,6 +22244,12 @@ var SyncEngine = class extends EventEmitter {
     this.deps.quarantine.release(id2);
     this.trigger("quarantine released");
     this.publish();
+  }
+};
+var EngineStoppingError = class extends Error {
+  constructor() {
+    super("The engine is stopping");
+    this.name = "EngineStoppingError";
   }
 };
 function emptyPlan() {
@@ -22292,6 +22341,11 @@ var RemoteMirror = class {
   lastFullListingAt = null;
   /** The mirror reflects the server at least as of this time (start of the last listing or completed poll). */
   asOf;
+  /** The engine's own changes made while each full listing in progress was under way. */
+  ownChangesDuringListings = /* @__PURE__ */ new Set();
+  /** Counts the engine's own changes; per node, the count when it was last changed so. */
+  ownChanges = 0;
+  ownChangedAt = /* @__PURE__ */ new Map();
   get isComplete() {
     return this.complete;
   }
@@ -22301,9 +22355,12 @@ var RemoteMirror = class {
   /** Replace the mirror with a complete listing. Throws (and marks unavailable) on failure. */
   async fullRefresh(signal) {
     const startedAt = this.now();
+    const ownChanges = [];
+    this.ownChangesDuringListings.add(ownChanges);
     try {
       const nodes = await listRemoteTree(this.remote, this.rootUid, signal);
       this.nodes = new Map(nodes.map((n2) => [n2.uid, n2]));
+      for (const change of ownChanges) this.applyChange(change);
       this.complete = true;
       this.available = true;
       this.lastFullListingAt = this.now();
@@ -22312,6 +22369,8 @@ var RemoteMirror = class {
       this.complete = false;
       this.available = false;
       throw error;
+    } finally {
+      this.ownChangesDuringListings.delete(ownChanges);
     }
   }
   /** Apply one node event by re-reading the node (events carry no metadata). */
@@ -22320,17 +22379,51 @@ var RemoteMirror = class {
       this.nodes.delete(event.nodeUid);
       return;
     }
+    const readFrom = this.ownChanges;
     const node = await this.remote.getNode(event.nodeUid);
+    if ((this.ownChangedAt.get(event.nodeUid) ?? 0) > readFrom) return;
     if (node === null) this.nodes.delete(event.nodeUid);
     else this.nodes.set(node.uid, node);
     this.available = true;
   }
-  /** Our own completed mutation: reflect it immediately instead of waiting for the event stream. */
+  /**
+   * A change the engine itself made on Proton (the executor reports it once verified): reflect it
+   * at once instead of waiting for its event. Under load the event arrives after the next cycle
+   * has planned, and a plan from the older tree undoes the change or records a conflict with it.
+   * The event, when it comes, re-reads the node and agrees.
+   */
+  applyOwnChange(change) {
+    const changedAt = ++this.ownChanges;
+    for (const uid of this.applyChange(change)) this.ownChangedAt.set(uid, changedAt);
+    for (const during of this.ownChangesDuringListings) during.push(change);
+  }
   upsert(node) {
     this.nodes.set(node.uid, node);
   }
+  /**
+   * Forget a node and everything under it (a trashed folder stays as an upsert, marked trashed).
+   * Returns the uids forgotten.
+   */
   remove(uid) {
-    this.nodes.delete(uid);
+    const gone = /* @__PURE__ */ new Set([uid]);
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const node of this.nodes.values()) {
+        if (!gone.has(node.uid) && node.parentUid !== void 0 && gone.has(node.parentUid)) {
+          gone.add(node.uid);
+          grew = true;
+        }
+      }
+    }
+    for (const g2 of gone) this.nodes.delete(g2);
+    return [...gone];
+  }
+  /** Apply a change; returns the uids it touched. */
+  applyChange(change) {
+    if (change.type === "remove") return this.remove(change.uid);
+    this.upsert(change.node);
+    return [change.node.uid];
   }
   /**
    * When a known, non-trashed item last changed (ms): the content's own time when the
