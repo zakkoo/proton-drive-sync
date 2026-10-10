@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.zakkoo.proton-drive",
   "name": "Proton Drive Sync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "zakko",
   "license": "MIT",
   "homepage": "https://github.com/zakkoo/proton-drive-client-tool",

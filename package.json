@@ -1,6 +1,6 @@
 {
   "name": "proton-drive-sync",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Robust two-way sync between a local directory and Proton Drive",
   "private": true,
   "type": "module",
