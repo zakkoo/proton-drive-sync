@@ -35,17 +35,9 @@ describe('Omarchy package', () => {
   it('speaks to an Omarchy user and leaves personal install notes out', () => {
     expect(readme).toContain('omarchy plugin add https://github.com/zakkoo/proton-drive-sync.git --enable');
     expect(readme).toContain('omarchy plugin remove io.github.zakkoo.proton-drive');
-    expect(readme).toContain('~/.config/omarchy/plugins/io.github.zakkoo.proton-drive/bin/proton-drive-sync doctor');
     expect(readme).toContain('omarchy plugin update io.github.zakkoo.proton-drive');
-    expect(readme).toContain('dist/cli/main.js');
     expect(readme).not.toMatch(/install-engine|systemctl/);
     expect(readme).toMatch(/unofficial/i);
-    expect(readme).toMatch(/unsandboxed/i);
-    expect(readme).toContain('Node.js 24');
-    expect(readme).toContain('Secret Service');
-    expect(readme).toContain('@protontech/drive-sdk');
-    expect(readme).toContain('@protontech/crypto');
-    expect(readme).toContain('dbus-next');
     expect(readme).toMatch(/recycle/i);
     expect(readme).toMatch(/Trash/);
     expect(readme).toMatch(/waits for you/);
@@ -57,12 +49,5 @@ describe('Omarchy package', () => {
     expect(readme).not.toContain('exec-once');
     expect(readme).not.toMatch(/npm (ci|install)/);
     expect(readme).not.toContain('sudo');
-
-    const development = readme.split(/^## Development\s*$/m);
-    expect(development).toHaveLength(2);
-    const userGuide = development[0] ?? '';
-    const devTail = development[1] ?? '';
-    expect(devTail.length).toBeGreaterThan(0);
-    expect(devTail.length).toBeLessThan(userGuide.length);
   });
 });

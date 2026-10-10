@@ -25,19 +25,19 @@ The image supplied as `plugin-card-proton-drive-client-tool.png` SHALL be moved 
 - **THEN** the only root preview file is `preview.png` and it is the supplied card
 
 ### Requirement: License and dependency notice
-The repository root SHALL contain an MIT `LICENSE` whose copyright holder is zakko. The existing Proton copyright notice under the adapted Proton code SHALL remain. The README SHALL name the external dependencies required to build and run the engine, including Node.js 24 or newer, a Secret Service, `@protontech/drive-sdk`, `@protontech/crypto`, `dbus-next`, and `picomatch`, bundled into the committed engine, and SHALL state that the plugin is an unofficial integration not affiliated with Proton AG or the Omarchy project.
+The repository root SHALL contain an MIT `LICENSE` whose copyright holder is zakko. The existing Proton copyright notice under the adapted Proton code SHALL remain. The README SHALL state that the plugin is an unofficial integration not affiliated with Proton AG or the Omarchy project.
 
 #### Scenario: A reader looks up the license
 - **WHEN** someone opens the repository root
-- **THEN** they find an MIT `LICENSE` and a README that lists those dependencies and the unofficial status
+- **THEN** they find an MIT `LICENSE` and a README that states the unofficial status
 
 ### Requirement: README is for an Omarchy user
 The root README SHALL be the user guide. It SHALL be written in the second person for someone on Omarchy, with no path that belongs to a particular person and no pinned tool-manager install path. It SHALL include these commands exactly:
 
-- `omarchy plugin add https://github.com/zakkoo/proton-drive-client-tool.git --enable`
+- `omarchy plugin add https://github.com/zakkoo/proton-drive-sync.git --enable`
 - `omarchy plugin remove io.github.zakkoo.proton-drive`
 
-It SHALL state that `omarchy plugin add` is the complete install and that the engine is the committed `dist/cli/main.js`, as defined by the engine-runtime-install capability. It SHALL say, in plain language, that synced files are not deleted outright, that a large delete or replace waits for confirmation, and that both copies are kept when the two sides disagree. It SHALL state that `omarchy plugin remove` removes the shell plugin and does not delete the sync folder, the Proton session, or the tool's config. It SHALL state that plugin code runs unsandboxed with the user's privileges. It SHALL NOT instruct the user to run a package install inside the plugin checkout, to pipe a download into a shell, or to use sudo. A development section MAY follow the user guide and SHALL be shorter than the user guide.
+It SHALL say, in plain language, that synced files are not deleted outright, that a large delete or replace waits for confirmation, and that both copies are kept when the two sides disagree. It SHALL state that `omarchy plugin remove` removes the shell plugin and does not delete the sync folder, the Proton session, or the tool's config. It SHALL NOT instruct the user to run a package install inside the plugin checkout, to pipe a download into a shell, or to use sudo. A development section MAY follow the user guide and SHALL be shorter than the user guide.
 
 #### Scenario: New Omarchy user
 - **WHEN** an Omarchy user opens the README
