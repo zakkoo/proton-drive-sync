@@ -3,6 +3,7 @@
  * store, and the full cycle (scan -> list -> reconcile -> execute) wired the
  * way the engine wires it. Supports "crash and reopen" for fault injection.
  */
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -180,15 +181,16 @@ export class SyncHarness {
   // ---- cycle -------------------------------------------------------------
 
   /**
-   * `digest: 'engine'` hashes only what the engine would (see `needsDigest`), so a
-   * baseline row that wrongly vouches for changed content shows up as missing work.
+   * `digest: 'engine'` (the default) hashes only what the engine would (see `needsDigest`), so a
+   * baseline row that wrongly vouches for changed content shows up as missing work, as it would in
+   * production. `digest: 'all'` hashes every file, which can repair such a row and hide the defect.
    */
   async buildInput(options: { digest?: 'all' | 'engine' } = {}): Promise<ReconcileInput> {
     const baseline = new Map<string, BaselineItem>();
     for (const row of this.baseline.all()) baseline.set(row.relPath, baselineRowToItem(row));
     const ignored = createIgnoreMatcher(DEFAULTS.ignore);
     const snapshot = await scanLocalTree(this.root, { ignore: ignored });
-    const rule = options.digest === 'engine' ? (relPath: string) => needsDigest(this.baseline.byPath(relPath), snapshot.entries.get(relPath)) : () => true;
+    const rule = options.digest === 'all' ? () => true : (relPath: string) => needsDigest(this.baseline.byPath(relPath), snapshot.entries.get(relPath));
     const local = await localViewFromSnapshot(snapshot, this.digests, rule);
     const nodes = await listRemoteTree(this.fake, this.remoteRootUid);
     const remote = remoteViewFromNodes(nodes, this.remoteRootUid);
@@ -234,8 +236,10 @@ export class SyncHarness {
 
   /**
    * Every baseline row must describe an existing local item and a live remote node
-   * with the recorded revision. Only meaningful once the world has settled: while
-   * changes are pending, rows legitimately lag behind the side that changed.
+   * with the recorded revision, and a file's row must vouch only for content both sides
+   * really hold: its local digest is the file's actual digest, and the remote node has the
+   * same bytes. Only meaningful once the world has settled: while changes are pending,
+   * rows legitimately lag behind the side that changed.
    */
   assertBaselineConsistent(ignore: ReadonlySet<string> = new Set()): void {
     for (const row of this.baseline.all()) {
@@ -246,6 +250,13 @@ export class SyncHarness {
       const rec = this.fake.record(row.nodeUid);
       if (rec === undefined || rec.trashed) throw new Error(`baseline ${row.relPath}: remote node ${row.nodeUid} missing or trashed`);
       if (row.kind === 'file' && rec.revisionUid !== row.revisionUid) throw new Error(`baseline ${row.relPath}: remote revision ${String(rec.revisionUid)} differs from ${String(row.revisionUid)}`);
+      if (row.kind === 'file') {
+        const local = readFileSync(path.join(this.root, row.relPath));
+        const localSha1 = createHash('sha1').update(local).digest('hex');
+        if (row.localSha1 !== null && row.localSha1 !== localSha1) throw new Error(`baseline ${row.relPath}: recorded local digest ${row.localSha1} but the file's content is ${localSha1}`);
+        const remote = this.fake.contentOf(row.nodeUid);
+        if (remote?.equals(local) !== true) throw new Error(`baseline ${row.relPath}: the two sides hold different content`);
+      }
     }
   }
 }
