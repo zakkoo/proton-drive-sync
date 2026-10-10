@@ -6,7 +6,7 @@
   "author": "zakko",
   "license": "MIT",
   "homepage": "https://github.com/zakkoo/proton-drive-client-tool",
-  "description": "Proton Drive, finally on your Omarchy bar. Pick a folder on your machine and one in Drive: create, edit, rename, or move on either side and the other side follows. Your password stays on Proton's sign-in page. Pause, resume, and keep both conflict copies from the chip. Deletes go to recycle or Trash, and a large change waits for you.",
+  "description": "One folder on your machine. The same files in Proton Drive. Create, edit, rename, or move on either side, and the other side follows. Delete a file on your machine and it goes to a recycle folder. Delete it in Proton Drive and it goes to Trash. A large delete or replace waits for you. Change the same file on both sides, and you keep both copies. You sign in through Proton's Drive SDK. You run this unofficial plugin on Omarchy until Proton ships Linux sync. Unaffiliated with Proton AG or Omarchy.",
   "kinds": ["service", "bar-widget"],
   "entryPoints": {
     "service": "omarchy/Service.qml",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Proton Drive",
-    "description": "Proton Drive, finally on your Omarchy bar. Pick a folder on your machine and one in Drive: create, edit, rename, or move on either side and the other side follows. Your password stays on Proton's sign-in page. Pause, resume, and keep both conflict copies from the chip. Deletes go to recycle or Trash, and a large change waits for you.",
+    "description": "One folder on your machine. The same files in Proton Drive. Create, edit, rename, or move on either side, and the other side follows. Delete a file on your machine and it goes to a recycle folder. Delete it in Proton Drive and it goes to Trash. A large delete or replace waits for you. Change the same file on both sides, and you keep both copies. You sign in through Proton's Drive SDK. You run this unofficial plugin on Omarchy until Proton ships Linux sync. Unaffiliated with Proton AG or Omarchy.",
     "category": "Files",
     "aliases": ["proton", "drive", "sync"],
     "allowMultiple": false,
