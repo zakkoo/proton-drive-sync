@@ -20,7 +20,7 @@ import type { JournalEntry } from '../state/journal.js';
 import { ConflictRepo } from '../state/misc.js';
 import type { LocalFingerprint, Operation, OperationKind } from '../reconcile/types.js';
 import type { RemoteNode } from '../remote/interface.js';
-import { sha1File } from '../remote/transfer.js';
+import { evidenceRow, hashedEvidence, movedEvidence, statEvidence, type LocalEvidence } from './evidence.js';
 import { TEMP_FILE_PREFIX, tempDir } from './localWrite.js';
 import type { ExecutorContext } from './types.js';
 
@@ -181,23 +181,9 @@ async function recoverConflictRename(ctx: ExecutorContext, entry: JournalEntry):
   return outcome;
 }
 
-function row(ctx: ExecutorContext, relPath: string, kind: 'file' | 'dir', node: RemoteNode, sha1: string | null): BaselineRow {
-  const st = statSync(path.join(ctx.root, relPath));
-  return {
-    relPath,
-    kind,
-    localDev: st.dev,
-    localIno: st.ino,
-    localSize: kind === 'file' ? st.size : 0,
-    localMtimeMs: st.mtimeMs,
-    localSha1: sha1,
-    nodeUid: node.uid,
-    parentUid: node.parentUid ?? null,
-    remoteName: node.name,
-    revisionUid: node.revisionUid ?? null,
-    remoteSha1: node.claimedSha1 ?? null,
-    syncedAt: ctx.now?.() ?? Date.now(),
-  };
+/** A baseline row from `local`: a stat and the digest of the content the file held with it (see evidence.ts). */
+function row(ctx: ExecutorContext, relPath: string, kind: 'file' | 'dir', node: RemoteNode, local: LocalEvidence): BaselineRow {
+  return evidenceRow(relPath, kind, node, local, ctx.now?.() ?? Date.now());
 }
 
 function localExists(ctx: ExecutorContext, relPath: string): Stats | null {
@@ -214,17 +200,19 @@ async function inspect(ctx: ExecutorContext, op: Operation): Promise<Verdict> {
     case 'upload': {
       const local = localExists(ctx, op.relPath);
       if (local === null) return { kind: 'abandoned', note: 'local source is gone; cannot verify what was uploaded' };
-      const { sha1 } = await sha1File(path.join(ctx.root, op.relPath));
+      const evidence = await hashedEvidence(path.join(ctx.root, op.relPath));
+      if (evidence === null) return { kind: 'failed', note: 'local file changed while it was checked; replanned' };
+      const { sha1 } = evidence;
       if (op.mode === 'revision' && op.remoteUid !== undefined) {
         const node = await remote.getNode(op.remoteUid);
-        if (node?.claimedSha1 === sha1) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'file', node, sha1)], removeSubtrees: [], renames: [], note: 'remote already holds the uploaded revision' };
+        if (node?.claimedSha1 === sha1) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'file', node, evidence)], removeSubtrees: [], renames: [], note: 'remote already holds the uploaded revision' };
         return { kind: 'failed', note: 'remote does not hold the uploaded content' };
       }
       const parentRow = op.relPath.includes('/') ? ctx.baseline.byPath(op.relPath.slice(0, op.relPath.lastIndexOf('/'))) : null;
       const parentUid = op.relPath.includes('/') ? parentRow?.nodeUid : ctx.remoteRootUid;
       if (parentUid === undefined) return { kind: 'failed', note: 'remote parent unknown; will be replanned' };
       const match = (await remote.listChildren(parentUid)).find((c) => c.name === nameOf(op.relPath) && !c.isTrashed && c.type === 'file');
-      if (match?.claimedSha1 === sha1) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'file', match, sha1)], removeSubtrees: [], renames: [], note: 'remote already holds the uploaded file' };
+      if (match?.claimedSha1 === sha1) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'file', match, evidence)], removeSubtrees: [], renames: [], note: 'remote already holds the uploaded file' };
       return { kind: 'failed', note: match === undefined ? 'upload did not land' : 'a different file is at the destination' };
     }
     case 'download': {
@@ -236,8 +224,10 @@ async function inspect(ctx: ExecutorContext, op: Operation): Promise<Verdict> {
       if (local.ino === previous?.ino && local.mtimeMs === previous.mtimeMs && local.size === previous.size) {
         return { kind: 'failed', note: 'target still holds the previous version; replanned' };
       }
-      const { sha1 } = await sha1File(path.join(ctx.root, op.relPath));
-      if (node.claimedSha1 !== undefined && node.claimedSha1 === sha1) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'file', node, sha1)], removeSubtrees: [], renames: [], note: 'downloaded content is in place' };
+      const evidence = await hashedEvidence(path.join(ctx.root, op.relPath));
+      if (evidence === null) return { kind: 'failed', note: 'local file changed while it was checked; replanned' };
+      const { sha1 } = evidence;
+      if (node.claimedSha1 !== undefined && node.claimedSha1 === sha1) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'file', node, evidence)], removeSubtrees: [], renames: [], note: 'downloaded content is in place' };
       if (node.claimedSha1 === undefined) return { kind: 'abandoned', note: 'no remote digest to verify the downloaded file against' };
       return { kind: 'abandoned', note: 'local file matches neither the previous nor the remote version' };
     }
@@ -249,7 +239,7 @@ async function inspect(ctx: ExecutorContext, op: Operation): Promise<Verdict> {
         const node = await remote.getNode(op.remoteUid);
         if (node === null) return { kind: 'abandoned', note: 'moved locally but the remote node is gone' };
         const old = ctx.baseline.byPath(op.baselineFrom ?? op.from);
-        return { kind: 'completed', upserts: [row(ctx, op.to, dst.isDirectory() ? 'dir' : 'file', node, old?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], note: 'local move already done' };
+        return { kind: 'completed', upserts: [row(ctx, op.to, dst.isDirectory() ? 'dir' : 'file', node, movedEvidence(old, ctx.root, op.to))], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], note: 'local move already done' };
       }
       return { kind: 'abandoned', note: 'neither the source nor the expected destination is in the planned state' };
     }
@@ -262,7 +252,7 @@ async function inspect(ctx: ExecutorContext, op: Operation): Promise<Verdict> {
         const old = ctx.baseline.byPath(op.baselineFrom ?? op.from);
         const local = localExists(ctx, op.to);
         if (local === null) return { kind: 'abandoned', note: 'remote moved but the local item is not at the destination' };
-        return { kind: 'completed', upserts: [row(ctx, op.to, node.type === 'folder' ? 'dir' : 'file', node, old?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], note: 'remote move already done' };
+        return { kind: 'completed', upserts: [row(ctx, op.to, node.type === 'folder' ? 'dir' : 'file', node, movedEvidence(old, ctx.root, op.to))], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], note: 'remote move already done' };
       }
       return { kind: 'failed', note: 'remote move not performed; replanned' };
     }
@@ -283,13 +273,13 @@ async function inspect(ctx: ExecutorContext, op: Operation): Promise<Verdict> {
       const parentUid = op.relPath.includes('/') ? parentRow?.nodeUid : ctx.remoteRootUid;
       if (parentUid === undefined) return { kind: 'failed', note: 'remote parent unknown; replanned' };
       const match = (await remote.listChildren(parentUid)).find((c) => c.name === nameOf(op.relPath) && !c.isTrashed && c.type === 'folder');
-      if (match !== undefined && localExists(ctx, op.relPath) !== null) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'dir', match, null)], removeSubtrees: [], renames: [], note: 'remote folder exists' };
+      if (match !== undefined && localExists(ctx, op.relPath) !== null) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'dir', match, statEvidence(ctx.root, op.relPath))], removeSubtrees: [], renames: [], note: 'remote folder exists' };
       return { kind: 'failed', note: 'remote folder not created; replanned' };
     }
     case 'create_local_folder': {
       const node = await remote.getNode(op.remoteUid);
       const local = localExists(ctx, op.relPath);
-      if (node !== null && local?.isDirectory() === true) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'dir', node, null)], removeSubtrees: [], renames: [], note: 'local folder exists' };
+      if (node !== null && local?.isDirectory() === true) return { kind: 'completed', upserts: [row(ctx, op.relPath, 'dir', node, statEvidence(ctx.root, op.relPath))], removeSubtrees: [], renames: [], note: 'local folder exists' };
       return { kind: 'failed', note: 'local folder not created; replanned' };
     }
     case 'update_baseline':

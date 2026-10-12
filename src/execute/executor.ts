@@ -17,6 +17,7 @@ import type { Operation, RemoteFingerprint } from '../reconcile/types.js';
 import { RemoteError, type RemoteNode } from '../remote/interface.js';
 import { defaultSleep } from '../remote/proton/apiClient.js';
 import { uploadVerified } from '../remote/transfer.js';
+import { evidenceRow, movedEvidence, statEvidence, type LocalEvidence } from './evidence.js';
 import { atomicDownload, DiskFullError, fingerprintMismatch, TargetChangedError } from './localWrite.js';
 import { assertWritableInsideRoot } from '../safety/pathGuard.js';
 import { SimulatedCrashError, type ExecutionSummary, type ExecutorContext, type ExecutorEvent, type ExecutorStep, type PlanForExecution, type RemoteChange } from './types.js';
@@ -308,14 +309,16 @@ export class Executor {
       this.emit({ type: 'operation_skipped', operation: op, reason: `local item changed: ${changed}` });
       return 'skipped';
     }
+    // The planned fingerprint, just confirmed, is the stat the planned digest belongs to.
+    const local = op.itemKind === 'file' ? op.local : { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs, sha1: null };
     this.ctx.baseline.upsert({
       relPath: op.relPath,
       kind: op.itemKind,
-      localDev: st.dev,
-      localIno: st.ino,
-      localSize: st.size,
-      localMtimeMs: st.mtimeMs,
-      localSha1: op.local.sha1 ?? null,
+      localDev: local.dev,
+      localIno: local.ino,
+      localSize: local.size,
+      localMtimeMs: local.mtimeMs,
+      localSha1: local.sha1 ?? null,
       nodeUid: op.remote.uid,
       parentUid: op.remote.parentUid ?? null,
       remoteName: op.remote.name,
@@ -399,23 +402,15 @@ export class Executor {
     return row.nodeUid;
   }
 
-  private localRow(relPath: string, kind: 'file' | 'dir', node: RemoteNode, sha1: string | null): BaselineRow {
-    const st = statSync(path.join(this.ctx.root, relPath));
-    return {
-      relPath,
-      kind,
-      localDev: st.dev,
-      localIno: st.ino,
-      localSize: kind === 'file' ? st.size : 0,
-      localMtimeMs: st.mtimeMs,
-      localSha1: sha1,
-      nodeUid: node.uid,
-      parentUid: node.parentUid ?? null,
-      remoteName: node.name,
-      revisionUid: node.revisionUid ?? null,
-      remoteSha1: node.claimedSha1 ?? null,
-      syncedAt: this.now(),
-    };
+  /** A baseline row from `local`: a stat and the digest of the content the file held with it (see evidence.ts). */
+  private localRow(relPath: string, kind: 'file' | 'dir', node: RemoteNode, local: LocalEvidence): BaselineRow {
+    return evidenceRow(relPath, kind, node, local, this.now());
+  }
+
+  /** The planned local fingerprint and digest, for an upload found to have landed already. */
+  private static plannedEvidence(op: Extract<Operation, { kind: 'upload' }>, sha1: string): LocalEvidence {
+    const { dev, ino, size, mtimeMs } = op.expectedLocal;
+    return { dev, ino, size, mtimeMs, sha1 };
   }
 
   private async act(op: Operation, attempt: number): Promise<ActResult> {
@@ -426,14 +421,14 @@ export class Executor {
         const st = statSync(path.join(root, op.relPath));
         const node = await remote.createFolder(parentUid, nameOf(op.relPath), new Date(st.mtimeMs));
         this.createdRemoteDirs.set(op.relPath, node.uid);
-        return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'dir', node, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid } };
+        return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'dir', node, statEvidence(root, op.relPath))], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid } };
       }
       case 'create_local_folder': {
         const node = await remote.getNode(op.remoteUid);
         if (node === null) throw new PreconditionError(`remote folder ${op.remoteUid} vanished`);
         assertWritableInsideRoot(root, op.relPath);
         await mkdir(path.join(root, op.relPath), { recursive: false });
-        return { upserts: [this.localRow(op.relPath, 'dir', node, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid } };
+        return { upserts: [this.localRow(op.relPath, 'dir', node, statEvidence(root, op.relPath))], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid } };
       }
       case 'upload': {
         const abs = path.join(root, op.relPath);
@@ -448,7 +443,7 @@ export class Executor {
         // The local file must still be what we hashed.
         const local = fingerprintMismatch(op.relPath, op.expectedLocal, root);
         if (local !== null) throw new PreconditionError(`local file changed during upload: ${local}`);
-        return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'file', node, uploaded.sha1)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: uploaded.revisionUid, sha1: uploaded.sha1, size: uploaded.size, attempt } };
+        return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'file', node, { ...uploaded.local, sha1: uploaded.sha1 })], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: uploaded.revisionUid, sha1: uploaded.sha1, size: uploaded.size, attempt } };
       }
       case 'download': {
         const node = await remote.getNode(op.remoteUid);
@@ -457,7 +452,7 @@ export class Executor {
           onProgress: (bytes) => { this.emit({ type: 'transfer_progress', operation: op, bytes, total: node.claimedSize }); },
           signal: this.cancel.signal,
         });
-        return { upserts: [this.localRow(op.relPath, 'file', node, result.sha1)], removeSubtrees: [], renames: [], outcome: { sha1: result.sha1, size: result.size, verifiedAgainstClaim: result.verifiedAgainstClaim, recycledPrevious: result.recycledPrevious } };
+        return { upserts: [this.localRow(op.relPath, 'file', node, { ...result.local, sha1: result.sha1 })], removeSubtrees: [], renames: [], outcome: { sha1: result.sha1, size: result.size, verifiedAgainstClaim: result.verifiedAgainstClaim, recycledPrevious: result.recycledPrevious } };
       }
       case 'move_local': {
         const from = path.join(root, op.from);
@@ -473,7 +468,7 @@ export class Executor {
         const row = this.ctx.baseline.byPath(op.baselineFrom ?? op.from);
         const kind = st.isDirectory() ? 'dir' : 'file';
         return {
-          upserts: [{ ...this.localRow(op.to, kind, node, row?.localSha1 ?? null) }],
+          upserts: [this.localRow(op.to, kind, node, movedEvidence(row, root, op.to))],
           removeSubtrees: [],
           renames: [{ from: op.baselineFrom ?? op.from, to: op.to }],
           outcome: { from: op.from, to: op.to },
@@ -493,7 +488,7 @@ export class Executor {
         if (!existsSync(path.join(root, op.to))) return { remoteChanges: [{ type: 'upsert', node: verify }], upserts: [], removeSubtrees: [], renames: [], outcome: { from: op.from, to: op.to, localMoveFollows: true } };
         const row = this.ctx.baseline.byPath(op.baselineFrom ?? op.from);
         const kind = verify.type === 'folder' ? 'dir' : 'file';
-        return { remoteChanges: [{ type: 'upsert', node: verify }], upserts: [this.localRow(op.to, kind, verify, row?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { from: op.from, to: op.to } };
+        return { remoteChanges: [{ type: 'upsert', node: verify }], upserts: [this.localRow(op.to, kind, verify, movedEvidence(row, root, op.to))], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { from: op.from, to: op.to } };
       }
       case 'recycle_local': {
         const item = this.ctx.recycle.recycle(op.relPath, 'deleted remotely');
@@ -519,7 +514,7 @@ export class Executor {
         if (op.mode === 'revision' && op.remoteUid !== undefined) {
           const node = await remote.getNode(op.remoteUid);
           if (node !== null && node.claimedSha1 === op.expectedLocal.sha1 && op.expectedLocal.sha1 !== undefined) {
-            return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'file', node, node.claimedSha1 ?? null)], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: node.revisionUid, landedBeforeRetry: true } };
+            return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.relPath, 'file', node, Executor.plannedEvidence(op, op.expectedLocal.sha1))], removeSubtrees: [], renames: [], outcome: { nodeUid: node.uid, revisionUid: node.revisionUid, landedBeforeRetry: true } };
           }
           return null;
         }
@@ -528,7 +523,7 @@ export class Executor {
         const match = children.find((c) => c.name === nameOf(op.relPath) && !c.isTrashed && c.type === 'file');
         const expectedSha1 = op.expectedLocal.sha1;
         if (match !== undefined && expectedSha1 !== undefined && match.claimedSha1 === expectedSha1) {
-          return { remoteChanges: [{ type: 'upsert', node: match }], upserts: [this.localRow(op.relPath, 'file', match, expectedSha1)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, revisionUid: match.revisionUid, landedBeforeRetry: true } };
+          return { remoteChanges: [{ type: 'upsert', node: match }], upserts: [this.localRow(op.relPath, 'file', match, Executor.plannedEvidence(op, expectedSha1))], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, revisionUid: match.revisionUid, landedBeforeRetry: true } };
         }
         return null;
       }
@@ -542,7 +537,7 @@ export class Executor {
         if (node !== null && node.parentUid === this.remoteParentUid(op.to) && node.name === nameOf(op.to)) {
           if (!existsSync(path.join(this.ctx.root, op.to))) return { remoteChanges: [{ type: 'upsert', node }], upserts: [], removeSubtrees: [], renames: [], outcome: { landedBeforeRetry: true, localMoveFollows: true } };
           const row = this.ctx.baseline.byPath(op.baselineFrom ?? op.from);
-          return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.to, node.type === 'folder' ? 'dir' : 'file', node, row?.localSha1 ?? null)], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { landedBeforeRetry: true } };
+          return { remoteChanges: [{ type: 'upsert', node }], upserts: [this.localRow(op.to, node.type === 'folder' ? 'dir' : 'file', node, movedEvidence(row, this.ctx.root, op.to))], removeSubtrees: [], renames: [{ from: op.baselineFrom ?? op.from, to: op.to }], outcome: { landedBeforeRetry: true } };
         }
         return null;
       }
@@ -552,7 +547,7 @@ export class Executor {
         const match = children.find((c) => c.name === nameOf(op.relPath) && !c.isTrashed && c.type === 'folder');
         if (match === undefined) return null;
         this.createdRemoteDirs.set(op.relPath, match.uid);
-        return { remoteChanges: [{ type: 'upsert', node: match }], upserts: [this.localRow(op.relPath, 'dir', match, null)], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, landedBeforeRetry: true } };
+        return { remoteChanges: [{ type: 'upsert', node: match }], upserts: [this.localRow(op.relPath, 'dir', match, statEvidence(this.ctx.root, op.relPath))], removeSubtrees: [], renames: [], outcome: { nodeUid: match.uid, landedBeforeRetry: true } };
       }
       case 'create_local_folder':
       case 'download':
